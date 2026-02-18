@@ -148,7 +148,7 @@ class AgentLoop:
             if isinstance(cron_tool, CronTool):
                 cron_tool.set_context(channel, chat_id)
 
-    async def _run_agent_loop(self, initial_messages: list[dict]) -> tuple[str | None, list[str]]:
+    async def _run_agent_loop(self, initial_messages: list[dict]) -> tuple[str | None, list[str], str | None]:
         """
         Run the agent iteration loop.
 
@@ -156,11 +156,12 @@ class AgentLoop:
             initial_messages: Starting messages for the LLM conversation.
 
         Returns:
-            Tuple of (final_content, list_of_tools_used).
+            Tuple of (final_content, list_of_tools_used, reasoning_content).
         """
         messages = initial_messages
         iteration = 0
         final_content = None
+        final_reasoning = None
         tools_used: list[str] = []
 
         while iteration < self.max_iterations:
@@ -203,9 +204,10 @@ class AgentLoop:
                 messages.append({"role": "user", "content": "Reflect on the results and decide next steps."})
             else:
                 final_content = response.content
+                final_reasoning = response.reasoning_content
                 break
 
-        return final_content, tools_used
+        return final_content, tools_used, final_reasoning
 
     async def run(self) -> None:
         """Run the agent loop, processing messages from the bus."""
@@ -300,7 +302,7 @@ class AgentLoop:
             channel=msg.channel,
             chat_id=msg.chat_id,
         )
-        final_content, tools_used = await self._run_agent_loop(initial_messages)
+        final_content, tools_used, reasoning = await self._run_agent_loop(initial_messages)
 
         if final_content is None:
             final_content = "I've completed processing but have no response to give."
@@ -313,11 +315,15 @@ class AgentLoop:
                             tools_used=tools_used if tools_used else None)
         self.sessions.save(session)
         
+        metadata = msg.metadata or {}
+        if reasoning:
+            metadata["reasoning_content"] = reasoning
+        
         return OutboundMessage(
             channel=msg.channel,
             chat_id=msg.chat_id,
             content=final_content,
-            metadata=msg.metadata or {},  # Pass through for channel-specific needs (e.g. Slack thread_ts)
+            metadata=metadata,
         )
     
     async def _process_system_message(self, msg: InboundMessage) -> OutboundMessage | None:
@@ -348,7 +354,7 @@ class AgentLoop:
             channel=origin_channel,
             chat_id=origin_chat_id,
         )
-        final_content, _ = await self._run_agent_loop(initial_messages)
+        final_content, _, _reasoning = await self._run_agent_loop(initial_messages)
 
         if final_content is None:
             final_content = "Background task completed."
@@ -454,7 +460,7 @@ Respond with ONLY valid JSON, no markdown fences."""
         session_key: str = "cli:direct",
         channel: str = "cli",
         chat_id: str = "direct",
-    ) -> str:
+    ) -> str | dict:
         """
         Process a message directly (for CLI or cron usage).
         
@@ -465,7 +471,8 @@ Respond with ONLY valid JSON, no markdown fences."""
             chat_id: Source chat ID (for tool context routing).
         
         Returns:
-            The agent's response.
+            The agent's response string, or a dict with 'response' and 'reasoning'
+            keys when reasoning_content is available (HTTP channel).
         """
         await self._connect_mcp()
         msg = InboundMessage(
@@ -476,4 +483,10 @@ Respond with ONLY valid JSON, no markdown fences."""
         )
         
         response = await self._process_message(msg, session_key=session_key)
-        return response.content if response else ""
+        if not response:
+            return ""
+        
+        reasoning = (response.metadata or {}).get("reasoning_content")
+        if reasoning and channel == "http":
+            return {"response": response.content, "reasoning": reasoning}
+        return response.content

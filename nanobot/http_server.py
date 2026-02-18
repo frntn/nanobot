@@ -49,13 +49,16 @@ def _create_chat_handler(agent: "AgentLoop"):
         logger.info(f"[http] Chat request: session={session_key} message={message[:80]}")
 
         try:
-            response = await agent.process_direct(
+            result = await agent.process_direct(
                 content=message,
                 session_key=session_key,
                 channel="http",
                 chat_id="direct",
             )
-            return JSONResponse({"response": response})
+            # process_direct returns a dict with reasoning for HTTP channel
+            if isinstance(result, dict):
+                return JSONResponse(result)
+            return JSONResponse({"response": result})
         except Exception as e:
             logger.error(f"[http] Error processing message: {e}", exc_info=True)
             return JSONResponse(
