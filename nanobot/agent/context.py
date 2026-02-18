@@ -105,7 +105,7 @@ IMPORTANT: When responding to direct questions or conversations, reply directly 
 Only use the 'message' tool when you need to send a message to a specific chat channel (like WhatsApp).
 For normal conversation, just respond with text - do not call the message tool.
 
-Always be helpful, accurate, and concise. When using tools, think step by step: what you know, what you need, and why you chose this tool.
+Always be helpful, accurate, and concise. Think carefully before responding, but NEVER show your reasoning process in the response. Only output the final answer or action — no "let me think", no "looking at the context", no chain-of-thought. Your internal reasoning is handled separately and must not leak into visible output.
 When remembering something important, write to {workspace_path}/memory/MEMORY.md
 To recall past events, grep {workspace_path}/memory/HISTORY.md"""
     

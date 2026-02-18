@@ -163,6 +163,7 @@ class AgentDefaults(BaseModel):
     temperature: float = 0.7
     max_tool_iterations: int = 20
     memory_window: int = 50
+    thinking: str = "low"  # "off" | "low" — extended thinking for supported models (Anthropic)
 
 
 class AgentsConfig(BaseModel):

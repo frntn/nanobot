@@ -48,6 +48,7 @@ class LLMProvider(ABC):
         model: str | None = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
+        thinking: str = "off",
     ) -> LLMResponse:
         """
         Send a chat completion request.
@@ -58,6 +59,7 @@ class LLMProvider(ABC):
             model: Model identifier (provider-specific).
             max_tokens: Maximum tokens in response.
             temperature: Sampling temperature.
+            thinking: Extended thinking mode — "off" or "low".
         
         Returns:
             LLMResponse with content and/or tool calls.

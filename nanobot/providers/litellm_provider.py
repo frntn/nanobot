@@ -110,6 +110,7 @@ class LiteLLMProvider(LLMProvider):
         model: str | None = None,
         max_tokens: int = 4096,
         temperature: float = 0.7,
+        thinking: str = "off",
     ) -> LLMResponse:
         """
         Send a chat completion request via LiteLLM.
@@ -120,6 +121,7 @@ class LiteLLMProvider(LLMProvider):
             model: Model identifier (e.g., 'anthropic/claude-sonnet-4-5').
             max_tokens: Maximum tokens in response.
             temperature: Sampling temperature.
+            thinking: Extended thinking mode — "off" or "low".
         
         Returns:
             LLMResponse with content and/or tool calls.
@@ -136,6 +138,15 @@ class LiteLLMProvider(LLMProvider):
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
+        
+        # Extended thinking for Anthropic models
+        # When enabled: temperature must be 1, budget_tokens sets thinking depth
+        if thinking != "off" and self._is_anthropic_model(model):
+            budget = {"low": 1024}.get(thinking, 1024)
+            kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
+            kwargs["temperature"] = 1  # Anthropic requirement when thinking is enabled
+            # Ensure max_tokens covers thinking + response
+            kwargs["max_tokens"] = max(max_tokens, budget + 4096)
         
         # Apply model-specific overrides (e.g. kimi-k2.5 temperature)
         self._apply_model_overrides(model, kwargs)
@@ -165,6 +176,12 @@ class LiteLLMProvider(LLMProvider):
                 content=f"Error calling LLM: {str(e)}",
                 finish_reason="error",
             )
+    
+    @staticmethod
+    def _is_anthropic_model(model: str) -> bool:
+        """Check if a resolved model name is an Anthropic model."""
+        model_lower = model.lower()
+        return "claude" in model_lower or model_lower.startswith("anthropic/")
     
     def _parse_response(self, response: Any) -> LLMResponse:
         """Parse LiteLLM response into our standard format."""
