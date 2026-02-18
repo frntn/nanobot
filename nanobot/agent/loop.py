@@ -11,7 +11,7 @@ from loguru import logger
 
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
-from nanobot.providers.base import LLMProvider
+from nanobot.providers.base import LLMProvider, StreamChunk
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.filesystem import ReadFileTool, WriteFileTool, EditFileTool, ListDirTool
@@ -314,6 +314,10 @@ class AgentLoop:
         session.add_message("assistant", final_content,
                             tools_used=tools_used if tools_used else None)
         self.sessions.save(session)
+
+        # Generate a smart title after the first user→assistant exchange
+        if len(session.messages) == 2 and not session.metadata.get("title"):
+            asyncio.create_task(self._generate_title(session, msg.content, final_content))
         
         metadata = msg.metadata or {}
         if reasoning:
@@ -454,6 +458,32 @@ Respond with ONLY valid JSON, no markdown fences."""
         except Exception as e:
             logger.error(f"Memory consolidation failed: {e}")
 
+    async def _generate_title(self, session: Session, user_message: str, assistant_response: str) -> None:
+        """Generate a smart title for the session using a lightweight LLM call."""
+        try:
+            prompt = (
+                "Résume cette conversation en un titre court (5-8 mots max, en français). "
+                "Réponds UNIQUEMENT avec le titre, sans guillemets ni ponctuation finale.\n\n"
+                f"User: {user_message[:500]}\n"
+                f"Assistant: {assistant_response[:500]}"
+            )
+            response = await self.provider.chat(
+                messages=[
+                    {"role": "system", "content": "Tu génères des titres courts et descriptifs."},
+                    {"role": "user", "content": prompt},
+                ],
+                model=self.model,
+                max_tokens=30,
+                temperature=0.3,
+            )
+            title = (response.content or "").strip().strip('"').strip("'").strip(".")
+            if title:
+                session.metadata["title"] = title
+                self.sessions.save(session)
+                logger.info(f"Smart title generated for {session.key}: {title}")
+        except Exception as e:
+            logger.warning(f"Failed to generate smart title for {session.key}: {e}")
+
     async def process_direct(
         self,
         content: str,
@@ -490,3 +520,195 @@ Respond with ONLY valid JSON, no markdown fences."""
         if reasoning and channel == "http":
             return {"response": response.content, "reasoning": reasoning}
         return response.content
+
+    async def process_direct_stream(
+        self,
+        content: str,
+        session_key: str = "cli:direct",
+        channel: str = "http",
+        chat_id: str = "direct",
+    ):
+        """Streaming variant of process_direct().
+
+        Yields StreamChunk objects as the LLM generates tokens.
+        For tool-call iterations, processing happens internally (non-streamed).
+        Only the final response iteration is streamed token-by-token.
+
+        Yields:
+            StreamChunk with type "reasoning", "content", or "done".
+        """
+        await self._connect_mcp()
+        msg = InboundMessage(
+            channel=channel,
+            sender_id="user",
+            chat_id=chat_id,
+            content=content,
+        )
+
+        key = session_key or msg.session_key
+        session = self.sessions.get_or_create(key)
+
+        if len(session.messages) > self.memory_window:
+            asyncio.create_task(self._consolidate_memory(session))
+
+        self._set_tool_context(msg.channel, msg.chat_id)
+        messages = self.context.build_messages(
+            history=session.get_history(max_messages=self.memory_window),
+            current_message=msg.content,
+            media=msg.media if msg.media else None,
+            channel=msg.channel,
+            chat_id=msg.chat_id,
+        )
+
+        # Run the agent loop with streaming on the final iteration
+        iteration = 0
+        final_content = ""
+        final_reasoning = ""
+        tools_used: list[str] = []
+
+        while iteration < self.max_iterations:
+            iteration += 1
+
+            # Check if provider supports streaming
+            if not hasattr(self.provider, "chat_stream"):
+                # Fallback to non-streaming
+                response = await self.provider.chat(
+                    messages=messages,
+                    tools=self.tools.get_definitions(),
+                    model=self.model,
+                    temperature=self.temperature,
+                    max_tokens=self.max_tokens,
+                    thinking=self.thinking,
+                )
+                if response.has_tool_calls:
+                    tool_call_dicts = [
+                        {"id": tc.id, "type": "function",
+                         "function": {"name": tc.name, "arguments": json.dumps(tc.arguments)}}
+                        for tc in response.tool_calls
+                    ]
+                    messages = self.context.add_assistant_message(
+                        messages, response.content, tool_call_dicts,
+                        reasoning_content=response.reasoning_content,
+                    )
+                    for tc in response.tool_calls:
+                        tools_used.append(tc.name)
+                        # Emit tool call lifecycle events for the frontend
+                        yield StreamChunk(type="tool_call_start", delta=tc.name, tool_call_id=tc.id)
+                        yield StreamChunk(type="tool_call_delta", delta=json.dumps(tc.arguments), tool_call_id=tc.id)
+                        yield StreamChunk(type="tool_call_end", tool_call_id=tc.id)
+                        yield StreamChunk(type="status", delta=f"Utilisation de {tc.name}...")
+                        result = await self.tools.execute(tc.name, tc.arguments)
+                        result_str = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+                        yield StreamChunk(type="tool_result", delta=result_str, tool_call_id=tc.id, tool_call_name=tc.name)
+                        messages = self.context.add_tool_result(messages, tc.id, tc.name, result)
+                    messages.append({"role": "user", "content": "Reflect on the results and decide next steps."})
+                    continue
+                # Final response — yield it
+                if response.reasoning_content:
+                    yield StreamChunk(type="reasoning", delta=response.reasoning_content)
+                if response.content:
+                    yield StreamChunk(type="content", delta=response.content)
+                final_content = response.content or ""
+                final_reasoning = response.reasoning_content or ""
+                yield StreamChunk(type="done", finish_reason="stop")
+                break
+
+            # Streaming path: yield tokens IMMEDIATELY as they arrive.
+            # If tool calls appear, we've already yielded some content — that's
+            # fine for UX (user sees partial text, then more after tool execution).
+            content_buf = ""
+            reasoning_buf = ""
+            tc_names: dict[int, str] = {}
+            tc_ids: dict[int, str] = {}
+            tc_args: dict[int, str] = {}
+            has_tool_calls = False
+
+            async for chunk in self.provider.chat_stream(
+                messages=messages,
+                tools=self.tools.get_definitions(),
+                model=self.model,
+                temperature=self.temperature,
+                max_tokens=self.max_tokens,
+                thinking=self.thinking,
+            ):
+                if chunk.type == "reasoning":
+                    reasoning_buf += chunk.delta
+                    yield chunk  # Stream reasoning immediately
+                elif chunk.type == "content":
+                    content_buf += chunk.delta
+                    yield chunk  # Stream content immediately
+                elif chunk.type == "tool_call_start":
+                    has_tool_calls = True
+                    tc_names[chunk.tool_call_index] = chunk.delta
+                    tc_ids[chunk.tool_call_index] = chunk.tool_call_id
+                    tc_args.setdefault(chunk.tool_call_index, "")
+                    # Forward to SSE so the frontend can show tool call in progress
+                    yield StreamChunk(
+                        type="tool_call_start",
+                        delta=chunk.delta,
+                        tool_call_id=chunk.tool_call_id,
+                    )
+                elif chunk.type == "tool_call_delta":
+                    has_tool_calls = True
+                    tc_args.setdefault(chunk.tool_call_index, "")
+                    tc_args[chunk.tool_call_index] += chunk.delta
+                    # Forward args delta with the tool_call_id resolved from the start chunk
+                    yield StreamChunk(
+                        type="tool_call_delta",
+                        delta=chunk.delta,
+                        tool_call_id=tc_ids.get(chunk.tool_call_index, ""),
+                    )
+                elif chunk.type == "done":
+                    pass  # handled below
+
+            if has_tool_calls:
+                # Intermediate iteration — process tool calls
+                tool_call_dicts = []
+                tool_calls_parsed = []
+                for idx in sorted(tc_names.keys()):
+                    args_raw = tc_args.get(idx, "{}")
+                    try:
+                        args = json.loads(args_raw)
+                    except json.JSONDecodeError:
+                        import json_repair as jr
+                        args = jr.loads(args_raw)
+                    tc_id = tc_ids.get(idx, f"call_{idx}")
+                    tc_name = tc_names[idx]
+                    tool_call_dicts.append({
+                        "id": tc_id, "type": "function",
+                        "function": {"name": tc_name, "arguments": json.dumps(args)},
+                    })
+                    tool_calls_parsed.append((tc_id, tc_name, args))
+
+                messages = self.context.add_assistant_message(
+                    messages, content_buf or None, tool_call_dicts,
+                    reasoning_content=reasoning_buf or None,
+                )
+                for tc_id, tc_name, tc_args_dict in tool_calls_parsed:
+                    tools_used.append(tc_name)
+                    yield StreamChunk(type="tool_call_end", tool_call_id=tc_id)
+                    yield StreamChunk(type="status", delta=f"Utilisation de {tc_name}...")
+                    logger.info(f"Tool call: {tc_name}({json.dumps(tc_args_dict, ensure_ascii=False)[:200]})")
+                    result = await self.tools.execute(tc_name, tc_args_dict)
+                    result_str = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
+                    yield StreamChunk(type="tool_result", delta=result_str, tool_call_id=tc_id, tool_call_name=tc_name)
+                    messages = self.context.add_tool_result(messages, tc_id, tc_name, result)
+                messages.append({"role": "user", "content": "Reflect on the results and decide next steps."})
+                continue
+
+            # Final iteration — all chunks already yielded above
+            final_content = content_buf
+            final_reasoning = reasoning_buf
+            yield StreamChunk(type="done", finish_reason="stop")
+            break
+
+        # Save to session history
+        if final_content:
+            session.add_message("user", content)
+            session.add_message("assistant", final_content,
+                                tools_used=tools_used if tools_used else None)
+            self.sessions.save(session)
+
+            # Generate a smart title after the first user→assistant exchange
+            if len(session.messages) == 2 and not session.metadata.get("title"):
+                asyncio.create_task(self._generate_title(session, content, final_content))

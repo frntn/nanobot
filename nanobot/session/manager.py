@@ -150,30 +150,88 @@ class SessionManager:
         """Remove a session from the in-memory cache."""
         self._cache.pop(key, None)
     
-    def list_sessions(self) -> list[dict[str, Any]]:
-        """
-        List all sessions.
-        
+    def list_sessions(self, prefix: str | None = None) -> list[dict[str, Any]]:
+        """List all sessions, optionally filtered by key prefix.
+
+        Args:
+            prefix: If set, only return sessions whose key starts with this.
+
         Returns:
-            List of session info dicts.
+            List of session info dicts sorted by updated_at descending.
         """
         sessions = []
-        
+
         for path in self.sessions_dir.glob("*.jsonl"):
             try:
-                # Read just the metadata line
+                key = path.stem.replace("_", ":")
+
+                if prefix and not key.startswith(prefix):
+                    continue
+
                 with open(path) as f:
                     first_line = f.readline().strip()
-                    if first_line:
-                        data = json.loads(first_line)
-                        if data.get("_type") == "metadata":
-                            sessions.append({
-                                "key": path.stem.replace("_", ":"),
-                                "created_at": data.get("created_at"),
-                                "updated_at": data.get("updated_at"),
-                                "path": str(path)
-                            })
+                    if not first_line:
+                        continue
+
+                    data = json.loads(first_line)
+                    if data.get("_type") != "metadata":
+                        continue
+
+                    # Use smart title from metadata if available
+                    meta = data.get("metadata", {})
+                    smart_title = meta.get("title", "")
+
+                    # Read first user message as fallback preview/title
+                    fallback_title = ""
+                    message_count = 0
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            msg = json.loads(line)
+                            message_count += 1
+                            if not fallback_title and msg.get("role") == "user":
+                                fallback_title = msg.get("content", "")[:80]
+                        except Exception:
+                            continue
+
+                    if message_count == 0:
+                        continue  # Skip empty sessions
+
+                    sessions.append({
+                        "key": key,
+                        "title": smart_title or fallback_title or "(sans titre)",
+                        "message_count": message_count,
+                        "created_at": data.get("created_at"),
+                        "updated_at": data.get("updated_at"),
+                    })
             except Exception:
                 continue
-        
+
         return sorted(sessions, key=lambda x: x.get("updated_at", ""), reverse=True)
+
+    def get_messages(self, key: str) -> list[dict[str, Any]] | None:
+        """Get all messages for a session.
+
+        Returns None if session doesn't exist.
+        """
+        session = self._load(key)
+        if session is None:
+            return None
+        return [
+            {"role": m["role"], "content": m["content"], "timestamp": m.get("timestamp")}
+            for m in session.messages
+        ]
+
+    def delete_session(self, key: str) -> bool:
+        """Delete a session from disk and cache.
+
+        Returns True if deleted, False if not found.
+        """
+        path = self._get_session_path(key)
+        self._cache.pop(key, None)
+        if path.exists():
+            path.unlink()
+            return True
+        return False

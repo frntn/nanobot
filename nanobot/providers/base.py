@@ -14,6 +14,17 @@ class ToolCallRequest:
 
 
 @dataclass
+class StreamChunk:
+    """A single chunk from a streaming LLM response."""
+    type: str  # "content" | "reasoning" | "tool_call_start" | "tool_call_delta" | "done"
+    delta: str = ""
+    tool_call_index: int = 0
+    tool_call_id: str = ""
+    tool_call_name: str = ""
+    finish_reason: str | None = None
+
+
+@dataclass
 class LLMResponse:
     """Response from an LLM provider."""
     content: str | None

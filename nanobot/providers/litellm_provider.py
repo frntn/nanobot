@@ -8,7 +8,9 @@ from typing import Any
 import litellm
 from litellm import acompletion
 
-from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
+from typing import AsyncGenerator
+
+from nanobot.providers.base import LLMProvider, LLMResponse, StreamChunk, ToolCallRequest
 from nanobot.providers.registry import find_by_model, find_gateway
 
 
@@ -177,6 +179,99 @@ class LiteLLMProvider(LLMProvider):
                 finish_reason="error",
             )
     
+    async def chat_stream(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+        model: str | None = None,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        thinking: str = "off",
+    ) -> AsyncGenerator[StreamChunk, None]:
+        """Streaming variant of chat() — yields StreamChunk objects as tokens arrive.
+
+        Same parameters as chat(). Yields StreamChunk with types:
+        - "reasoning": extended thinking delta
+        - "content": response text delta
+        - "tool_call_start": new tool call (name in delta, id in tool_call_id)
+        - "tool_call_delta": tool call arguments delta
+        - "done": end of stream (finish_reason set)
+        """
+        model = self._resolve_model(model or self.default_model)
+        max_tokens = max(1, max_tokens)
+
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "stream": True,
+        }
+
+        if thinking != "off" and self._is_anthropic_model(model):
+            budget = {"low": 1024}.get(thinking, 1024)
+            kwargs["thinking"] = {"type": "enabled", "budget_tokens": budget}
+            kwargs["temperature"] = 1
+            kwargs["max_tokens"] = max(max_tokens, budget + 4096)
+
+        self._apply_model_overrides(model, kwargs)
+
+        if self.api_key:
+            kwargs["api_key"] = self.api_key
+        if self.api_base:
+            kwargs["api_base"] = self.api_base
+        if self.extra_headers:
+            kwargs["extra_headers"] = self.extra_headers
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+
+        try:
+            response = await acompletion(**kwargs)
+            finish_reason = None
+
+            async for chunk in response:
+                choice = chunk.choices[0] if chunk.choices else None
+                if not choice:
+                    continue
+
+                delta = choice.delta
+
+                # Extended thinking / reasoning content
+                reasoning = getattr(delta, "reasoning_content", None)
+                if reasoning:
+                    yield StreamChunk(type="reasoning", delta=reasoning)
+
+                # Text content
+                if delta.content:
+                    yield StreamChunk(type="content", delta=delta.content)
+
+                # Tool calls
+                if hasattr(delta, "tool_calls") and delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        if tc.function and tc.function.name:
+                            yield StreamChunk(
+                                type="tool_call_start",
+                                delta=tc.function.name,
+                                tool_call_index=tc.index or 0,
+                                tool_call_id=tc.id or "",
+                            )
+                        if tc.function and tc.function.arguments:
+                            yield StreamChunk(
+                                type="tool_call_delta",
+                                delta=tc.function.arguments,
+                                tool_call_index=tc.index or 0,
+                            )
+
+                if choice.finish_reason:
+                    finish_reason = choice.finish_reason
+
+            yield StreamChunk(type="done", finish_reason=finish_reason)
+
+        except Exception as e:
+            yield StreamChunk(type="content", delta=f"Error calling LLM: {str(e)}")
+            yield StreamChunk(type="done", finish_reason="error")
+
     @staticmethod
     def _is_anthropic_model(model: str) -> bool:
         """Check if a resolved model name is an Anthropic model."""
