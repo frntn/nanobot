@@ -315,6 +315,7 @@ def _make_provider(config: Config):
 def gateway(
     port: int = typer.Option(18790, "--port", "-p", help="Gateway port"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Verbose output"),
+    http_port: int = typer.Option(None, "--http-port", help="Enable HTTP API on this port (e.g. 8080)"),
 ):
     """Start the nanobot gateway."""
     from nanobot.config.loader import load_config, get_data_dir
@@ -404,14 +405,24 @@ def gateway(
     
     console.print(f"[green]✓[/green] Heartbeat: every 30m")
     
+    # Optional HTTP API server
+    http_task = None
+    if http_port is not None:
+        from nanobot.http_server import create_http_app, run_http_server
+        http_app = create_http_app(agent)
+        console.print(f"[green]✓[/green] HTTP API: port {http_port}")
+    
     async def run():
         try:
             await cron.start()
             await heartbeat.start()
-            await asyncio.gather(
+            tasks = [
                 agent.run(),
                 channels.start_all(),
-            )
+            ]
+            if http_port is not None:
+                tasks.append(run_http_server(http_app, http_port))
+            await asyncio.gather(*tasks)
         except KeyboardInterrupt:
             console.print("\nShutting down...")
         finally:
