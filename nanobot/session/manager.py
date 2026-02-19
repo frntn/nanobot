@@ -224,6 +224,28 @@ class SessionManager:
             for m in session.messages
         ]
 
+    def rename_session(self, key: str, title: str) -> bool:
+        """Rename a session (update its title in metadata).
+
+        Returns True if renamed, False if session not found.
+        """
+        path = self._get_session_path(key)
+        if not path.exists():
+            return False
+
+        try:
+            session = self._load(key)
+            if session is None:
+                return False
+
+            session.metadata["title"] = title
+            session.updated_at = datetime.now()
+            self.save(session)
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to rename session {key}: {e}")
+            return False
+
     def delete_session(self, key: str) -> bool:
         """Delete a session from disk and cache.
 
