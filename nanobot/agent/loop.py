@@ -569,6 +569,9 @@ Respond with ONLY valid JSON, no markdown fences."""
         final_content = ""
         final_reasoning = ""
         tools_used: list[str] = []
+        persisted_tool_calls: list[dict[str, Any]] = []
+        persisted_tool_results: dict[str, str] = {}
+        reasoning_blocks: list[str] = []
 
         while iteration < self.max_iterations:
             iteration += 1
@@ -585,9 +588,18 @@ Respond with ONLY valid JSON, no markdown fences."""
                     thinking=self.thinking,
                 )
                 if response.has_tool_calls:
+                    if response.reasoning_content:
+                        reasoning_blocks.append(response.reasoning_content)
+
                     tool_call_dicts = [
-                        {"id": tc.id, "type": "function",
-                         "function": {"name": tc.name, "arguments": json.dumps(tc.arguments)}}
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.name,
+                                "arguments": json.dumps(tc.arguments, ensure_ascii=False),
+                            },
+                        }
                         for tc in response.tool_calls
                     ]
                     messages = self.context.add_assistant_message(
@@ -598,12 +610,25 @@ Respond with ONLY valid JSON, no markdown fences."""
                         tools_used.append(tc.name)
                         # Emit tool call lifecycle events for the frontend
                         yield StreamChunk(type="tool_call_start", delta=tc.name, tool_call_id=tc.id)
-                        yield StreamChunk(type="tool_call_delta", delta=json.dumps(tc.arguments), tool_call_id=tc.id)
+                        yield StreamChunk(
+                            type="tool_call_delta",
+                            delta=json.dumps(tc.arguments, ensure_ascii=False),
+                            tool_call_id=tc.id,
+                        )
                         yield StreamChunk(type="tool_call_end", tool_call_id=tc.id)
                         yield StreamChunk(type="status", delta=f"Utilisation de {tc.name}...")
                         result = await self.tools.execute(tc.name, tc.arguments)
                         result_str = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
                         yield StreamChunk(type="tool_result", delta=result_str, tool_call_id=tc.id, tool_call_name=tc.name)
+                        persisted_tool_calls.append({
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.name,
+                                "arguments": json.dumps(tc.arguments, ensure_ascii=False),
+                            },
+                        })
+                        persisted_tool_results[tc.id] = result_str
                         messages = self.context.add_tool_result(messages, tc.id, tc.name, result)
                     messages.append({"role": "user", "content": "Reflect on the results and decide next steps."})
                     continue
@@ -679,10 +704,17 @@ Respond with ONLY valid JSON, no markdown fences."""
                     tc_id = tc_ids.get(idx, f"call_{idx}")
                     tc_name = tc_names[idx]
                     tool_call_dicts.append({
-                        "id": tc_id, "type": "function",
-                        "function": {"name": tc_name, "arguments": json.dumps(args)},
+                        "id": tc_id,
+                        "type": "function",
+                        "function": {
+                            "name": tc_name,
+                            "arguments": json.dumps(args, ensure_ascii=False),
+                        },
                     })
                     tool_calls_parsed.append((tc_id, tc_name, args))
+
+                if reasoning_buf:
+                    reasoning_blocks.append(reasoning_buf)
 
                 messages = self.context.add_assistant_message(
                     messages, content_buf or None, tool_call_dicts,
@@ -696,6 +728,15 @@ Respond with ONLY valid JSON, no markdown fences."""
                     result = await self.tools.execute(tc_name, tc_args_dict)
                     result_str = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False)
                     yield StreamChunk(type="tool_result", delta=result_str, tool_call_id=tc_id, tool_call_name=tc_name)
+                    persisted_tool_calls.append({
+                        "id": tc_id,
+                        "type": "function",
+                        "function": {
+                            "name": tc_name,
+                            "arguments": json.dumps(tc_args_dict, ensure_ascii=False),
+                        },
+                    })
+                    persisted_tool_results[tc_id] = result_str
                     messages = self.context.add_tool_result(messages, tc_id, tc_name, result)
                 messages.append({"role": "user", "content": "Reflect on the results and decide next steps."})
                 continue
@@ -706,13 +747,28 @@ Respond with ONLY valid JSON, no markdown fences."""
             yield StreamChunk(type="done", finish_reason="stop")
             break
 
+        if final_reasoning:
+            reasoning_blocks.append(final_reasoning)
+
         # Save to session history
-        if final_content:
+        if final_content or persisted_tool_calls or reasoning_blocks:
             session.add_message("user", content)
-            session.add_message("assistant", final_content,
-                                tools_used=tools_used if tools_used else None)
+
+            assistant_extras: dict[str, Any] = {}
+            if tools_used:
+                assistant_extras["tools_used"] = tools_used
+            if persisted_tool_calls:
+                assistant_extras["tool_calls"] = persisted_tool_calls
+            if persisted_tool_results:
+                assistant_extras["tool_results"] = persisted_tool_results
+            if reasoning_blocks:
+                assistant_extras["reasoning_blocks"] = reasoning_blocks
+            if final_reasoning:
+                assistant_extras["reasoning_content"] = final_reasoning
+
+            session.add_message("assistant", final_content, **assistant_extras)
             self.sessions.save(session)
 
             # Generate a smart title after the first user→assistant exchange
-            if len(session.messages) == 2 and not session.metadata.get("title"):
+            if final_content and len(session.messages) == 2 and not session.metadata.get("title"):
                 asyncio.create_task(self._generate_title(session, content, final_content))

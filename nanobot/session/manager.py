@@ -215,14 +215,14 @@ class SessionManager:
         """Get all messages for a session.
 
         Returns None if session doesn't exist.
+
+        Important: return full persisted message dicts (not only role/content)
+        so reconnect consumers can restore tool/reasoning metadata.
         """
         session = self._load(key)
         if session is None:
             return None
-        return [
-            {"role": m["role"], "content": m["content"], "timestamp": m.get("timestamp")}
-            for m in session.messages
-        ]
+        return [dict(m) for m in session.messages]
 
     def rename_session(self, key: str, title: str) -> bool:
         """Rename a session (update its title in metadata).
