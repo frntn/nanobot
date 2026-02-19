@@ -7,7 +7,7 @@ Endpoints:
   POST /api/chat         — Send a message, get a JSON response
   POST /api/chat/stream  — Send a message, get SSE stream of tokens
   POST /api/config/env   — Inject a secret into os.environ (for secure credential input)
-  GET  /api/health       — Health check
+  GET  /api/health       — Health check (unauthenticated — used by K8s probes)
 """
 
 import json
@@ -18,9 +18,55 @@ from typing import TYPE_CHECKING
 
 from loguru import logger
 from starlette.applications import Starlette
+from starlette.middleware import Middleware
+from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
+
+# ---------------------------------------------------------------------------
+# Authentication middleware
+# ---------------------------------------------------------------------------
+
+# Endpoints that do NOT require authentication (K8s liveness/readiness probes)
+_PUBLIC_PATHS = frozenset({"/api/health"})
+
+
+class BearerAuthMiddleware(BaseHTTPMiddleware):
+    """Validate ``Authorization: Bearer <secret>`` on all endpoints except health.
+
+    If the env var ``NANOBOT_API_SECRET`` is unset or empty, the middleware is
+    permissive (no-op) so that local development and tests keep working without
+    having to set the variable.
+    """
+
+    async def dispatch(self, request: Request, call_next):
+        expected_secret = os.environ.get("NANOBOT_API_SECRET", "")
+
+        # If no secret is configured, skip authentication (dev/test mode)
+        if not expected_secret:
+            return await call_next(request)
+
+        # Allow public paths through without auth
+        if request.url.path in _PUBLIC_PATHS:
+            return await call_next(request)
+
+        # Validate Authorization header
+        auth_header = request.headers.get("authorization", "")
+        if not auth_header.startswith("Bearer "):
+            return JSONResponse(
+                {"error": "Missing or invalid Authorization header"},
+                status_code=401,
+            )
+
+        token = auth_header[7:]  # strip "Bearer "
+        if token != expected_secret:
+            return JSONResponse(
+                {"error": "Invalid API secret"},
+                status_code=401,
+            )
+
+        return await call_next(request)
 
 # Upload constants
 UPLOAD_DIR = Path.home() / "uploads"
@@ -303,7 +349,10 @@ def create_http_app(agent: "AgentLoop") -> Starlette:
         Route("/api/config/env", config_env, methods=["POST"]),
         Route("/api/health", health, methods=["GET"]),
     ]
-    app = Starlette(routes=routes)
+    app = Starlette(
+        routes=routes,
+        middleware=[Middleware(BearerAuthMiddleware)],
+    )
     return app
 
 
