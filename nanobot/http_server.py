@@ -6,11 +6,13 @@ allowing direct programmatic access without terminal/WebSocket hacks.
 Endpoints:
   POST /api/chat         — Send a message, get a JSON response
   POST /api/chat/stream  — Send a message, get SSE stream of tokens
+  POST /api/config/env   — Inject a secret into os.environ (for secure credential input)
   GET  /api/health       — Health check
 """
 
 import json
 import os
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -241,6 +243,40 @@ async def upload_file(request: Request) -> JSONResponse:
         return JSONResponse({"detail": f"Failed to save file: {e}"}, status_code=500)
 
 
+async def config_env(request: Request) -> JSONResponse:
+    """Inject a secret into the nanobot process environment.
+
+    Accepts JSON: {"key": "ENV_VAR_NAME", "value": "secret_value"}
+    Sets os.environ[key] = value so the nanobot can use it immediately.
+
+    Security: The value is NEVER logged.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+    key = body.get("key", "").strip()
+    value = body.get("value")
+
+    if not key:
+        return JSONResponse({"error": "Missing or empty 'key' field"}, status_code=400)
+    if value is None:
+        return JSONResponse({"error": "Missing 'value' field"}, status_code=400)
+
+    # Validate key format: only allow alphanumeric + underscore (env var convention)
+    if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
+        return JSONResponse(
+            {"error": "Invalid key format. Use only A-Z, a-z, 0-9, underscore. Must start with a letter or underscore."},
+            status_code=400,
+        )
+
+    os.environ[key] = str(value)
+    logger.info(f"[http] Environment variable set: {key}=***")
+
+    return JSONResponse({"status": "ok", "key": key})
+
+
 async def health(request: Request) -> JSONResponse:
     """Health check endpoint."""
     return JSONResponse({"status": "ok"})
@@ -264,6 +300,7 @@ def create_http_app(agent: "AgentLoop") -> Starlette:
         Route("/api/sessions/{key:path}/messages", get_session_messages, methods=["GET"]),
         Route("/api/sessions/{key:path}", delete_session, methods=["DELETE"]),
         Route("/api/upload", upload_file, methods=["POST"]),
+        Route("/api/config/env", config_env, methods=["POST"]),
         Route("/api/health", health, methods=["GET"]),
     ]
     app = Starlette(routes=routes)
